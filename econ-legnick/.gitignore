@@ -1,0 +1,3 @@
+/build
+/shaders/*.glsl.h
+/deps

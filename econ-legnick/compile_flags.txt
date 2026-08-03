@@ -1,0 +1,4 @@
+-Ideps/sokol
+-Ideps/nuklear
+-I.
+-std=c99
