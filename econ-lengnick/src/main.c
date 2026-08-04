@@ -17,6 +17,7 @@
 #include "sokol_gfx.h"
 #include "sokol_glue.h"
 #include "sokol_log.h"
+#include "util/sokol_framebuffer.h"
 
 // include generated shaders file
 #include "shaders/triangle.glsl.h"
@@ -34,6 +35,27 @@
 #define SOKOL_NUKLEAR_IMPL
 #include "util/sokol_nuklear.h"
 
+// ============================================================================
+//
+// CONSTANTS
+//
+// ============================================================================
+
+#define WORLD_SIZE_X (512)
+#define WORLD_SIZE_Y (512)
+
+// ============================================================================
+//
+// MACROS
+//
+// ============================================================================
+
+// ============================================================================
+//
+// TYPES
+//
+// ============================================================================
+
 typedef struct {
   float position[3];
   float color[4];
@@ -44,7 +66,24 @@ static struct {
   sg_bindings bind;
   sg_pass_action pass_action;
   float bg_color[3];
+
+  // main framebuffer
+  sfb_framebuffer framebuffer;
+  uint8_t pixels[WORLD_SIZE_X][WORLD_SIZE_Y];
+  uint32_t palette[256];
 } state;
+
+// ============================================================================
+//
+// FORWARD DECLARATIONS
+//
+// ============================================================================
+
+// ============================================================================
+//
+// IMPLEMENTATIONS
+//
+// ============================================================================
 
 static void init(void) {
   sg_setup(&(sg_desc){
@@ -56,6 +95,10 @@ static void init(void) {
       .dpi_scale = sapp_dpi_scale(),
       .logger.func = slog_func,
       .enable_set_mouse_cursor = true,
+  });
+
+  sfb_setup(&(sfb_desc){
+      .logger.func = slog_func,
   });
 
   state.bg_color[0] = 0.1f;
@@ -95,6 +138,24 @@ static void init(void) {
                                          state.bg_color[2],
                                          1.0f,
                                      }}};
+
+  state.framebuffer = sfb_make_framebuffer(&(sfb_framebuffer_desc){
+      .width = WORLD_SIZE_X,
+      .height = WORLD_SIZE_Y,
+      .format = SFB_FORMAT_PALETTE8,
+  });
+
+  memset(&state.pixels, 0, sizeof(uint8_t) * WORLD_SIZE_X * WORLD_SIZE_Y);
+  state.palette[0] = 0xFFFF0000;
+  state.palette[1] = 0xFF0000FF;
+  int center_x = WORLD_SIZE_X / 2;
+  int center_y = WORLD_SIZE_Y / 2;
+  for (int i = 0; i < center_x; i++) {
+    for (int j = 0; j < center_y; j++) {
+      state.pixels[i][j] = 1;
+      state.pixels[i + center_x][j + center_y] = 1;
+    }
+  }
 }
 
 static void frame(void) {
@@ -126,6 +187,12 @@ static void frame(void) {
   }
   nk_end(ctx);
 
+  // blit pixels to framebuffer
+  sfb_update(state.framebuffer, &(sfb_update_desc){
+                                    .pixels = SG_RANGE(state.pixels),
+                                    .palette = SG_RANGE(state.palette),
+                                });
+
   // Update clear color
   state.pass_action.colors[0].clear_value.r = state.bg_color[0];
   state.pass_action.colors[0].clear_value.g = state.bg_color[1];
@@ -134,6 +201,9 @@ static void frame(void) {
   // Begin render pass
   sg_begin_pass(
       &(sg_pass){.action = state.pass_action, .swapchain = sglue_swapchain()});
+
+  // render framebuffer
+  sfb_render(state.framebuffer);
 
   // Draw triangle
   sg_apply_pipeline(state.pip);
