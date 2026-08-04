@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Centralized project configuration
 
-PROJECT_NAME="triangle"
+PROJECT_NAME="lengnick"
 CC="${CC:-clang}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

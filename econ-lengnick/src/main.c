@@ -49,6 +49,7 @@
 #define WORLD_SIZE_Y (128)
 
 #define THINGS_MAX (8192)
+#define EVENTS_MAX (1024)
 
 #define LIL_GUYS_MAX (16)
 
@@ -65,20 +66,25 @@ typedef size_t thing_id_t;
 
 typedef enum {
   // collection occupancy
-  FLAG_USED = (1 << 0),
+  // not needed since things are never destroyed during a run (only on reset)
+  // FLAG_USED = (1 << 0),
 
   // kind
   FLAG_FIRM = (1 << 1),
   FLAG_HOUSEHOLD = (1 << 2),
 
   // bools
-  FLAG_FIRM_OPEN_POSITION = (1 << 3),
+  FLAG_OPEN_POSITION = (1 << 3),
 } thing_flag_t;
 
 typedef struct {
   uint8_t flags;
+  /// amount of money the thing possesses
   currency_t liquidity;
+  /// amount of goods demand (felt for households, observed for firms)
   amount_t current_demand;
+
+  /// coordinates on the world map
   coord_t world_x;
   coord_t world_y;
 
@@ -88,12 +94,15 @@ typedef struct {
       currency_t reservation_wage;
     } household;
     struct {
-      currency_t *goods_price;
-      currency_t *wage_rate;
-      currency_t *monthly_revenue;
-      amount_t *inventory;
-      amount_t *months_since_hire_failure;
-      thing_id_t *worker_on_notice;
+      /// the price of each item in the inventory
+      currency_t goods_price;
+      /// the price the firm will pay for labor power
+      currency_t wage_rate;
+      /// amount of goods on hand
+      amount_t inventory;
+      currency_t monthly_revenue;
+      amount_t months_since_hire_failure;
+      thing_id_t worker_on_notice;
     } firm;
   } kind;
 } thing_t;
@@ -146,6 +155,8 @@ static struct {
 
 static struct {
   struct {
+    float labor_supply;
+    uint8_t month_length;
   } model;
 
   struct {
@@ -176,6 +187,35 @@ static struct {
 
   struct {
     size_t count;
+    /// amount of liquidity assigned to each firm at t=0
+    currency_t init_liquidity;
+    /// price of goods at each firm at t=0
+    currency_t init_goods_price;
+    /// amount of inventory in each firm at t=0
+    amount_t init_inventory;
+    /// initial wage rate at t=0
+    currency_t init_wage_rate;
+    /// the expected demand for goods per month
+    amount_t expected_demand;
+    /// number of months of filled positions before wage will be reduced (gamma)
+    amount_t wage_reduction_months;
+    /// upper bound for the wage adjustments (delta)
+    float wage_adjustment_upper;
+    /// range that inventories can be mantained relative to demand
+    float inventory_phi_upper;
+    float inventory_phi_lower;
+    /// range that prices can be marked up over costs
+    float price_phi_upper;
+    float price_phi_lower;
+    /// upper bound for the price adjustment (upsilon)
+    float price_adjustment_upper;
+    /// probability of changing the goods price (theta)
+    float price_adjustment_prob;
+    /// productivity multiple by which labor power is turned into labor output
+    /// (lambda)
+    float productivity_multiple;
+    /// percentage of income to reserve to cover bad times (chi)
+    float reserved_income_multiple;
   } firm;
 } config = {
     .household =
@@ -195,6 +235,21 @@ static struct {
     .firm =
         {
             .count = 32,
+            .init_liquidity = 400000,
+            .init_goods_price = 1000,
+            .init_inventory = 0,
+            .init_wage_rate = 100000,
+            .expected_demand = 1,
+            .wage_reduction_months = 24,
+            .wage_adjustment_upper = 0.019,
+            .inventory_phi_upper = 1.0,
+            .inventory_phi_lower = 1.025,
+            .price_phi_upper = 1.15,
+            .price_phi_lower = 1.025,
+            .price_adjustment_upper = 0.02,
+            .price_adjustment_prob = 0.75,
+            .productivity_multiple = 3.0,
+            .reserved_income_multiple = 0.1,
         },
 };
 
@@ -203,14 +258,31 @@ static struct {
 // FORWARD DECLARATIONS
 //
 // ============================================================================
+
+// gfx
 static void gfx_init();
 static void gfx_framebuffer_render();
 
-static void gui_draw();
+// gui
+static void gui_update();
 
+// model
+static void model_reset();
+
+// firms
+static void firms_init();
+
+// households
+static void households_init();
+
+// lil guys
 static void lil_guys_init();
 static void lil_guys_update();
 
+// config
+static float config_marginal_cost_deflator();
+
+// colors
 static rgba_t rgba_blend(rgba_t color1, rgba_t color2, float t);
 static rgba_t uint32_to_rgba(uint32_t color);
 static rgba_t sg_color_to_rgba(sg_color color);
@@ -227,15 +299,17 @@ static uint32_t rgba_to_uint32(rgba_t color);
 // ----------------------------------------------------------------------------
 
 static void init(void) {
-  srand(time(NULL));
+  // srand(time(NULL));
+  srand(42);
   gfx_init();
   lil_guys_init();
+  model_reset();
 }
 
 static void frame() {
   lil_guys_update();
 
-  gui_draw();
+  gui_update();
 
   // blit pixels to framebuffer
   sfb_update(state.gfx.framebuffer, &(sfb_update_desc){
@@ -335,7 +409,7 @@ static void gfx_framebuffer_render() {
 // ----------------------------------------------------------------------------
 // GUI
 // ----------------------------------------------------------------------------
-static void gui_draw() {
+static void gui_update() {
   struct nk_context *ctx = snk_new_frame();
 
   nk_style_hide_cursor(ctx);
@@ -367,6 +441,65 @@ static void gui_draw() {
     }
   }
   nk_end(ctx);
+}
+
+// ----------------------------------------------------------------------------
+// Model
+// ----------------------------------------------------------------------------
+static void model_reset() {
+  // zeroth thing is always zeroed
+  state.model.things_len = 1;
+  state.model.things[0] = (thing_t){0};
+
+  firms_init();
+  households_init();
+}
+
+// ----------------------------------------------------------------------------
+// Firms
+// ----------------------------------------------------------------------------
+static void firms_init() {
+  for (int i = 0; i < config.firm.count; i++) {
+    assert(state.model.things_len < THINGS_MAX);
+    state.model.things[state.model.things_len] = (thing_t){
+        .flags = FLAG_FIRM,
+        .liquidity = config.firm.init_liquidity,
+        .current_demand = config.firm.expected_demand,
+        .world_x = rand() % WORLD_SIZE_X,
+        .world_y = rand() % WORLD_SIZE_Y,
+        .kind.firm =
+            {
+                .goods_price = config.firm.init_goods_price,
+                .wage_rate = config.firm.init_wage_rate,
+                .inventory = config.firm.init_inventory,
+                .monthly_revenue = 0,
+            },
+    };
+    state.model.things_len++;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Households
+// ----------------------------------------------------------------------------
+
+static void households_init() {
+  for (int i = 0; i < config.household.count; i++) {
+    assert(state.model.things_len < THINGS_MAX);
+    state.model.things[state.model.things_len] = (thing_t){
+        .flags = FLAG_HOUSEHOLD,
+        .liquidity = config.household.init_liquidity,
+        .current_demand = 0,
+        .world_x = rand() % WORLD_SIZE_X,
+        .world_y = rand() % WORLD_SIZE_Y,
+        .kind.household =
+            {
+                .employer = 0,
+                .reservation_wage = config.household.init_reservation_wage,
+            },
+    };
+    state.model.things_len++;
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -420,6 +553,13 @@ static void lil_guys_update() {
     lil_guy_t *guy = &state.model.lil_guys[i];
     state.gfx.pixels[guy->world_x][guy->world_y] = rgba_to_uint32(guy->color);
   }
+}
+// ----------------------------------------------------------------------------
+// Config
+// ----------------------------------------------------------------------------
+static float config_marginal_cost_deflator() {
+  return config.firm.productivity_multiple * config.model.labor_supply *
+         config.model.month_length;
 }
 
 // ----------------------------------------------------------------------------

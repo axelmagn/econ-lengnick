@@ -1,6 +1,6 @@
 # Centralized project configuration for PowerShell
 
-$PROJECT_NAME = "triangle"
+$PROJECT_NAME = "lengnick"
 $CC = if ($env:CC) { $env:CC } else { "clang" }
 
 $SCRIPT_DIR = $PSScriptRoot
