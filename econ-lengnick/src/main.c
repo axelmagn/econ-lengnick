@@ -150,7 +150,6 @@ static struct {
 
   struct {
     size_t count;
-    uint32_t visibility_radius;
     /// amount of liquidity assigned to each household at t=0
     currency_t init_liquidity;
     /// reservation wage assigned to each household at t=0
@@ -171,6 +170,8 @@ static struct {
     float price_switching_prob;
     /// probability of replacing a firm that fails to supply
     float quant_switching_prob;
+    /// how far around their position the household can see when searching
+    float visibility_radius;
   } household;
 
   struct {
@@ -180,7 +181,6 @@ static struct {
     .household =
         {
             .count = 128,
-            .visibility_radius = 8,
             .init_liquidity = 100000,
             .unemployed_wage_decay_rate = 0.9f,
             .satisfaction_fraction = 0.95f,
@@ -189,6 +189,7 @@ static struct {
             .price_switching_threshold = 0.01f,
             .price_switching_prob = 0.25f,
             .quant_switching_prob = 0.25f,
+            .visibility_radius = 8,
         },
 
     .firm =
