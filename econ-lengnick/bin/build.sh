@@ -91,6 +91,7 @@ build_native() {
     echo "==> Compiling native executable (${CC}) for ${OS_NAME}..."
     mkdir -p "${BUILD_DIR}"
     "${CC}" -std=c99 -Wall -Wextra -O2 \
+        -g \
         -D_CRT_SECURE_NO_WARNINGS \
         -I"${INCLUDE_DIR}" \
         -I"${REPO_ROOT}" \
