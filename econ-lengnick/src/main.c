@@ -2,7 +2,6 @@
 // strict -std=c99
 #define _POSIX_C_SOURCE 200809L
 
-#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -49,19 +48,55 @@
 #define WORLD_SIZE_X (128)
 #define WORLD_SIZE_Y (128)
 
-#define LIL_GUYS_MAX (16)
+#define THINGS_MAX (8192)
 
-// ============================================================================
-//
-// MACROS
-//
-// ============================================================================
+#define LIL_GUYS_MAX (16)
 
 // ============================================================================
 //
 // TYPES
 //
 // ============================================================================
+
+typedef uint64_t currency_t;
+typedef uint64_t amount_t;
+typedef uint16_t coord_t;
+typedef size_t thing_id_t;
+
+typedef enum {
+  // collection occupancy
+  FLAG_USED = (1 << 0),
+
+  // kind
+  FLAG_FIRM = (1 << 1),
+  FLAG_HOUSEHOLD = (1 << 2),
+
+  // bools
+  FLAG_FIRM_OPEN_POSITION = (1 << 3),
+} thing_flag_t;
+
+typedef struct {
+  uint8_t flags;
+  currency_t liquidity;
+  amount_t current_demand;
+  coord_t world_x;
+  coord_t world_y;
+
+  union {
+    struct {
+      thing_id_t employer;
+      currency_t reservation_wage;
+    } household;
+    struct {
+      currency_t *goods_price;
+      currency_t *wage_rate;
+      currency_t *monthly_revenue;
+      amount_t *inventory;
+      amount_t *months_since_hire_failure;
+      thing_id_t *worker_on_notice;
+    } firm;
+  } kind;
+} thing_t;
 
 typedef struct {
   uint8_t a;
@@ -76,11 +111,20 @@ typedef struct {
   rgba_t color;
 } lil_guy_t;
 
+// ============================================================================
+//
+// STATIC DATA
+//
+// ============================================================================
+
 static struct {
   // simulated model
   struct {
     int lil_guys_count;
     lil_guy_t lil_guys[LIL_GUYS_MAX];
+
+    size_t things_len;
+    thing_t things[THINGS_MAX];
   } model;
 
   // graphics context
@@ -91,18 +135,85 @@ static struct {
     uint32_t pixels[WORLD_SIZE_X][WORLD_SIZE_Y];
     float fade_speed;
   } gfx;
-} state;
+} state = {
+    .gfx.bg_color.r = 0.1,
+    .gfx.bg_color.g = 0.1,
+    .gfx.bg_color.b = 0.12,
+    .gfx.bg_color.a = 1.0,
+
+    .gfx.fade_speed = 1.0,
+};
+
+static struct {
+  struct {
+  } model;
+
+  struct {
+    size_t count;
+    uint32_t visibility_radius;
+    /// amount of liquidity assigned to each household at t=0
+    currency_t init_liquidity;
+    /// reservation wage assigned to each household at t=0
+    currency_t init_reservation_wage;
+    /// unemployed reservation wage decay rate
+    float unemployed_wage_decay_rate;
+    /// Fraction of demand supplied that will satisfy the household desire
+    float satisfaction_fraction;
+    /// decay rate for consumption expenditure function (alpha)
+    /// in the range 0 < alpha < 1
+    float consumption_expenditure_decay;
+    /// probability of searching for new work, if employed (pi)
+    float employed_search_probability;
+    /// fraction a new firms price has to be less than the old firm before the
+    /// new firm will be picked (zeta)
+    float price_switching_threshold;
+    /// probability of looking for firm with cheaper prices
+    float price_switching_prob;
+    /// probability of replacing a firm that fails to supply
+    float quant_switching_prob;
+  } household;
+
+  struct {
+    size_t count;
+  } firm;
+} config = {
+    .household =
+        {
+            .count = 128,
+            .visibility_radius = 8,
+            .init_liquidity = 100000,
+            .unemployed_wage_decay_rate = 0.9f,
+            .satisfaction_fraction = 0.95f,
+            .consumption_expenditure_decay = 0.9f,
+            .employed_search_probability = 0.1f,
+            .price_switching_threshold = 0.01f,
+            .price_switching_prob = 0.25f,
+            .quant_switching_prob = 0.25f,
+        },
+
+    .firm =
+        {
+            .count = 32,
+        },
+};
 
 // ============================================================================
 //
 // FORWARD DECLARATIONS
 //
 // ============================================================================
+static void gfx_init();
+static void gfx_framebuffer_render();
 
-rgba_t rgba_blend(rgba_t color1, rgba_t color2, float t);
-rgba_t uint32_to_rgba(uint32_t color);
-rgba_t sg_color_to_rgba(sg_color color);
-uint32_t rgba_to_uint32(rgba_t color);
+static void gui_draw();
+
+static void lil_guys_init();
+static void lil_guys_update();
+
+static rgba_t rgba_blend(rgba_t color1, rgba_t color2, float t);
+static rgba_t uint32_to_rgba(uint32_t color);
+static rgba_t sg_color_to_rgba(sg_color color);
+static uint32_t rgba_to_uint32(rgba_t color);
 
 // ============================================================================
 //
@@ -110,138 +221,20 @@ uint32_t rgba_to_uint32(rgba_t color);
 //
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// Sokol Entrypoints
+// ----------------------------------------------------------------------------
+
 static void init(void) {
-  printf("init started!\n");
   srand(time(NULL));
-
-  sg_setup(&(sg_desc){
-      .environment = sglue_environment(),
-      .logger.func = slog_func,
-  });
-
-  snk_setup(&(snk_desc_t){
-      .dpi_scale = sapp_dpi_scale(),
-      .logger.func = slog_func,
-      .enable_set_mouse_cursor = true,
-  });
-
-  sfb_setup(&(sfb_desc){
-      .logger.func = slog_func,
-  });
-
-  state.gfx.bg_color.r = 0.1f;
-  state.gfx.bg_color.g = 0.1f;
-  state.gfx.bg_color.b = 0.12f;
-  state.gfx.bg_color.a = 1.0f;
-
-  state.gfx.fade_speed = 1.0;
-
-  // init lil guys
-  state.model.lil_guys_count = 4;
-  for (int i = 0; i < LIL_GUYS_MAX; i++) {
-    lil_guy_t *guy = &state.model.lil_guys[i];
-
-    guy->world_x = rand() % WORLD_SIZE_X;
-    guy->world_y = rand() % WORLD_SIZE_Y;
-
-    uint8_t r = rand();
-    uint8_t g = rand();
-    uint8_t b = rand();
-    uint8_t max_rgb = r > g ? r : g;
-    max_rgb = b > max_rgb ? b : max_rgb;
-    float scale = 255.0f / max_rgb;
-    guy->color.a = 0xFF;
-    guy->color.r = (uint8_t)(r * scale);
-    guy->color.g = (uint8_t)(g * scale);
-    guy->color.b = (uint8_t)(b * scale);
-  }
-
-  // Pass action setup
-  state.gfx.pass_action =
-      (sg_pass_action){.colors[0] = {
-                           .load_action = SG_LOADACTION_CLEAR,
-                           .clear_value = state.gfx.bg_color,
-                       }};
-
-  state.gfx.framebuffer = sfb_make_framebuffer(&(sfb_framebuffer_desc){
-      .width = WORLD_SIZE_X,
-      .height = WORLD_SIZE_Y,
-      .format = SFB_FORMAT_RGBA8,
-      .prescale = 8,
-  });
-
-  uint32_t bg_color = rgba_to_uint32(sg_color_to_rgba(state.gfx.bg_color));
-  memset(&state.gfx.pixels, bg_color,
-         sizeof(uint32_t) * WORLD_SIZE_X * WORLD_SIZE_Y);
-
-  printf("init completed!\n");
+  gfx_init();
+  lil_guys_init();
 }
 
-static void frame(void) {
-  // update lil guy
-  // state.lil_dude_x =
-  //     (state.lil_dude_x + WORLD_SIZE_X + (rand() % 3) - 1) % WORLD_SIZE_X;
-  // state.lil_dude_y =
-  //     (state.lil_dude_y + WORLD_SIZE_Y + (rand() % 3) - 1) % WORLD_SIZE_Y;
+static void frame() {
+  lil_guys_update();
 
-  // update lil guys
-  for (int i = 0; i < state.model.lil_guys_count; i++) {
-    lil_guy_t *guy = &state.model.lil_guys[i];
-    guy->world_x =
-        (guy->world_x + WORLD_SIZE_X + (rand() % 3) - 1) % WORLD_SIZE_X;
-    guy->world_y =
-        (guy->world_y + WORLD_SIZE_Y + (rand() % 3) - 1) % WORLD_SIZE_Y;
-  }
-
-  // update pixels
-  double dt = sapp_frame_duration();
-
-  for (int x = 0; x < WORLD_SIZE_X; x++) {
-    for (int y = 0; y < WORLD_SIZE_Y; y++) {
-      rgba_t pixel = uint32_to_rgba(state.gfx.pixels[x][y]);
-      rgba_t bg_color = sg_color_to_rgba(state.gfx.bg_color);
-      pixel = rgba_blend(pixel, bg_color, dt * state.gfx.fade_speed);
-      state.gfx.pixels[x][y] = rgba_to_uint32(pixel);
-    }
-  }
-
-  for (int i = 0; i < state.model.lil_guys_count; i++) {
-    lil_guy_t *guy = &state.model.lil_guys[i];
-    state.gfx.pixels[guy->world_x][guy->world_y] = rgba_to_uint32(guy->color);
-  }
-
-  // Build Nuklear UI
-  struct nk_context *ctx = snk_new_frame();
-
-  nk_style_hide_cursor(ctx);
-
-  if (nk_begin(ctx, "Parameters", nk_rect(0, 0, 260, 240),
-               NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE |
-                   NK_WINDOW_MINIMIZABLE | NK_WINDOW_TITLE)) {
-
-    nk_layout_row_dynamic(ctx, 25, 1);
-    nk_property_int(ctx, "Lil Guys:", 0, &state.model.lil_guys_count,
-                    LIL_GUYS_MAX, 1, 0.005f);
-
-    nk_layout_row_dynamic(ctx, 25, 1);
-    nk_label(ctx, "Background Clear Color:", NK_TEXT_LEFT);
-
-    nk_layout_row_dynamic(ctx, 25, 1);
-    nk_property_float(ctx, "Red:", 0.0f, &state.gfx.bg_color.r, 1.0f, 0.01f,
-                      0.005f);
-    nk_property_float(ctx, "Green:", 0.0f, &state.gfx.bg_color.g, 1.0f, 0.01f,
-                      0.005f);
-    nk_property_float(ctx, "Blue:", 0.0f, &state.gfx.bg_color.b, 1.0f, 0.01f,
-                      0.005f);
-
-    nk_layout_row_dynamic(ctx, 30, 1);
-    if (nk_button_label(ctx, "Reset Background")) {
-      state.gfx.bg_color.r = 0.1f;
-      state.gfx.bg_color.g = 0.1f;
-      state.gfx.bg_color.b = 0.12f;
-    }
-  }
-  nk_end(ctx);
+  gui_draw();
 
   // blit pixels to framebuffer
   sfb_update(state.gfx.framebuffer, &(sfb_update_desc){
@@ -256,18 +249,7 @@ static void frame(void) {
                            .swapchain = sglue_swapchain()});
 
   // render framebuffer
-  slbx_viewport vp = slbx_letterbox(sapp_width(), sapp_height(),
-                                    &(slbx_letterbox_desc){
-                                        .content_aspect_ratio = 1.0f,
-                                    });
-  sg_apply_viewport(vp.x, vp.y, vp.width, vp.height, true);
-  // sfb_render(state.gfx.framebuffer);
-  sfb_render_ex(state.gfx.framebuffer, &(sfb_render_desc){});
-
-  // Draw triangle
-  // sg_apply_pipeline(state.pip);
-  // sg_apply_bindings(&state.bind);
-  // sg_draw(0, 3, 1);
+  gfx_framebuffer_render();
 
   // Draw Nuklear UI on top
   snk_render(sapp_width(), sapp_height());
@@ -300,7 +282,150 @@ sapp_desc sokol_main(int argc, char *argv[]) {
   };
 }
 
-rgba_t rgba_blend(rgba_t color1, rgba_t color2, float t) {
+// ----------------------------------------------------------------------------
+// GFX
+// ----------------------------------------------------------------------------
+
+static void gfx_init() {
+  sg_setup(&(sg_desc){
+      .environment = sglue_environment(),
+      .logger.func = slog_func,
+  });
+
+  snk_setup(&(snk_desc_t){
+      .dpi_scale = sapp_dpi_scale(),
+      .logger.func = slog_func,
+      .enable_set_mouse_cursor = true,
+  });
+
+  sfb_setup(&(sfb_desc){
+      .logger.func = slog_func,
+  });
+
+  // Pass action setup
+  state.gfx.pass_action =
+      (sg_pass_action){.colors[0] = {
+                           .load_action = SG_LOADACTION_CLEAR,
+                           .clear_value = state.gfx.bg_color,
+                       }};
+
+  state.gfx.framebuffer = sfb_make_framebuffer(&(sfb_framebuffer_desc){
+      .width = WORLD_SIZE_X,
+      .height = WORLD_SIZE_Y,
+      .format = SFB_FORMAT_RGBA8,
+      .prescale = 8,
+  });
+
+  uint32_t bg_color = rgba_to_uint32(sg_color_to_rgba(state.gfx.bg_color));
+  memset(&state.gfx.pixels, bg_color,
+         sizeof(uint32_t) * WORLD_SIZE_X * WORLD_SIZE_Y);
+}
+
+/// render framebuffer
+static void gfx_framebuffer_render() {
+  // framebuffer should be letterboxed
+  slbx_viewport vp = slbx_letterbox(sapp_width(), sapp_height(),
+                                    &(slbx_letterbox_desc){
+                                        .content_aspect_ratio = 1.0f,
+                                    });
+  sg_apply_viewport(vp.x, vp.y, vp.width, vp.height, true);
+  sfb_render(state.gfx.framebuffer);
+}
+// ----------------------------------------------------------------------------
+// GUI
+// ----------------------------------------------------------------------------
+static void gui_draw() {
+  struct nk_context *ctx = snk_new_frame();
+
+  nk_style_hide_cursor(ctx);
+
+  if (nk_begin(ctx, "Parameters", nk_rect(0, 0, 260, 240),
+               NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE |
+                   NK_WINDOW_MINIMIZABLE | NK_WINDOW_TITLE)) {
+
+    nk_layout_row_dynamic(ctx, 25, 1);
+    nk_property_int(ctx, "Lil Guys:", 0, &state.model.lil_guys_count,
+                    LIL_GUYS_MAX, 1, 0.005f);
+
+    nk_layout_row_dynamic(ctx, 25, 1);
+    nk_label(ctx, "Background Clear Color:", NK_TEXT_LEFT);
+
+    nk_layout_row_dynamic(ctx, 25, 1);
+    nk_property_float(ctx, "Red:", 0.0f, &state.gfx.bg_color.r, 1.0f, 0.01f,
+                      0.005f);
+    nk_property_float(ctx, "Green:", 0.0f, &state.gfx.bg_color.g, 1.0f, 0.01f,
+                      0.005f);
+    nk_property_float(ctx, "Blue:", 0.0f, &state.gfx.bg_color.b, 1.0f, 0.01f,
+                      0.005f);
+
+    nk_layout_row_dynamic(ctx, 30, 1);
+    if (nk_button_label(ctx, "Reset Background")) {
+      state.gfx.bg_color.r = 0.1f;
+      state.gfx.bg_color.g = 0.1f;
+      state.gfx.bg_color.b = 0.12f;
+    }
+  }
+  nk_end(ctx);
+}
+
+// ----------------------------------------------------------------------------
+// Lil Guys
+// ----------------------------------------------------------------------------
+
+static void lil_guys_init() {
+  state.model.lil_guys_count = 4;
+  for (int i = 0; i < LIL_GUYS_MAX; i++) {
+    lil_guy_t *guy = &state.model.lil_guys[i];
+
+    guy->world_x = rand() % WORLD_SIZE_X;
+    guy->world_y = rand() % WORLD_SIZE_Y;
+
+    uint8_t r = rand();
+    uint8_t g = rand();
+    uint8_t b = rand();
+    uint8_t max_rgb = r > g ? r : g;
+    max_rgb = b > max_rgb ? b : max_rgb;
+    float scale = 255.0f / max_rgb;
+    guy->color.a = 0xFF;
+    guy->color.r = (uint8_t)(r * scale);
+    guy->color.g = (uint8_t)(g * scale);
+    guy->color.b = (uint8_t)(b * scale);
+  }
+}
+
+static void lil_guys_update() {
+  // update lil guys
+  for (int i = 0; i < state.model.lil_guys_count; i++) {
+    lil_guy_t *guy = &state.model.lil_guys[i];
+    guy->world_x =
+        (guy->world_x + WORLD_SIZE_X + (rand() % 3) - 1) % WORLD_SIZE_X;
+    guy->world_y =
+        (guy->world_y + WORLD_SIZE_Y + (rand() % 3) - 1) % WORLD_SIZE_Y;
+  }
+
+  // update pixels
+  double dt = sapp_frame_duration();
+
+  for (int x = 0; x < WORLD_SIZE_X; x++) {
+    for (int y = 0; y < WORLD_SIZE_Y; y++) {
+      rgba_t pixel = uint32_to_rgba(state.gfx.pixels[x][y]);
+      rgba_t bg_color = sg_color_to_rgba(state.gfx.bg_color);
+      pixel = rgba_blend(pixel, bg_color, dt * state.gfx.fade_speed);
+      state.gfx.pixels[x][y] = rgba_to_uint32(pixel);
+    }
+  }
+
+  for (int i = 0; i < state.model.lil_guys_count; i++) {
+    lil_guy_t *guy = &state.model.lil_guys[i];
+    state.gfx.pixels[guy->world_x][guy->world_y] = rgba_to_uint32(guy->color);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Colors
+// ----------------------------------------------------------------------------
+
+static rgba_t rgba_blend(rgba_t color1, rgba_t color2, float t) {
   rgba_t result = {
       .r = (uint8_t)(color1.r + (color2.r - color1.r) * t),
       .g = (uint8_t)(color1.g + (color2.g - color1.g) * t),
@@ -310,7 +435,7 @@ rgba_t rgba_blend(rgba_t color1, rgba_t color2, float t) {
   return result;
 }
 
-rgba_t uint32_to_rgba(uint32_t color) {
+static rgba_t uint32_to_rgba(uint32_t color) {
   rgba_t result;
   result.a = (0xFF000000 & color) >> 24;
   result.b = (0x00FF0000 & color) >> 16;
@@ -319,7 +444,7 @@ rgba_t uint32_to_rgba(uint32_t color) {
   return result;
 }
 
-rgba_t sg_color_to_rgba(sg_color color) {
+static rgba_t sg_color_to_rgba(sg_color color) {
   rgba_t result;
   result.a = (uint8_t)(0xFF * color.a);
   result.r = (uint8_t)(0xFF * color.r);
@@ -328,6 +453,6 @@ rgba_t sg_color_to_rgba(sg_color color) {
   return result;
 }
 
-uint32_t rgba_to_uint32(rgba_t color) {
+static uint32_t rgba_to_uint32(rgba_t color) {
   return (color.a << 24) | (color.b << 16) | (color.g << 8) | color.r;
 }
