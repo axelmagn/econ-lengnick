@@ -51,8 +51,6 @@
 #define THINGS_MAX (8192)
 #define EVENTS_MAX (1024)
 
-#define LIL_GUYS_MAX (16)
-
 // ============================================================================
 //
 // TYPES
@@ -129,12 +127,16 @@ typedef struct {
 static struct {
   // simulated model
   struct {
-    int lil_guys_count;
-    lil_guy_t lil_guys[LIL_GUYS_MAX];
+    size_t steps;
 
     size_t things_len;
     thing_t things[THINGS_MAX];
+
   } model;
+
+  struct {
+    thing_id_t occupancy[WORLD_SIZE_X][WORLD_SIZE_Y];
+  } cache;
 
   // graphics context
   struct {
@@ -161,6 +163,7 @@ static struct {
 
   struct {
     size_t count;
+    uint32_t color;
     /// amount of liquidity assigned to each household at t=0
     currency_t init_liquidity;
     /// reservation wage assigned to each household at t=0
@@ -187,6 +190,7 @@ static struct {
 
   struct {
     size_t count;
+    uint32_t color;
     /// amount of liquidity assigned to each firm at t=0
     currency_t init_liquidity;
     /// price of goods at each firm at t=0
@@ -221,6 +225,7 @@ static struct {
     .household =
         {
             .count = 128,
+            .color = (0xFF << 24) | (0xFF << 16) | (0xFF << 8) | 0x00,
             .init_liquidity = 100000,
             .unemployed_wage_decay_rate = 0.9f,
             .satisfaction_fraction = 0.95f,
@@ -235,6 +240,7 @@ static struct {
     .firm =
         {
             .count = 32,
+            .color = (0xFF << 24) | (0xFF << 16) | (0x00 << 8) | 0xFF,
             .init_liquidity = 400000,
             .init_goods_price = 1000,
             .init_inventory = 0,
@@ -268,16 +274,20 @@ static void gui_update();
 
 // model
 static void model_reset();
+static void model_tick();
+
+// things
+static void things_draw();
+static void thing_move_to(thing_id_t thing_id, size_t x, size_t y);
+static void thing_try_move_to(thing_id_t thing_id, size_t x, size_t y);
+static void thing_try_random_move(thing_id_t thing_id);
 
 // firms
 static void firms_init();
+static void firms_update();
 
 // households
 static void households_init();
-
-// lil guys
-static void lil_guys_init();
-static void lil_guys_update();
 
 // config
 static float config_marginal_cost_deflator();
@@ -302,14 +312,16 @@ static void init(void) {
   // srand(time(NULL));
   srand(42);
   gfx_init();
-  lil_guys_init();
   model_reset();
 }
 
 static void frame() {
-  lil_guys_update();
+  printf("frame\n");
+  model_tick();
 
   gui_update();
+
+  things_draw();
 
   // blit pixels to framebuffer
   sfb_update(state.gfx.framebuffer, &(sfb_update_desc){
@@ -351,7 +363,7 @@ sapp_desc sokol_main(int argc, char *argv[]) {
       .width = 800,
       .height = 600,
       .high_dpi = true,
-      .window_title = "Sokol Triangle + Nuklear Starter",
+      .window_title = "Econ Lengnick",
       .icon.sokol_default = true,
       .logger.func = slog_func,
   };
@@ -418,9 +430,9 @@ static void gui_update() {
                NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE |
                    NK_WINDOW_MINIMIZABLE | NK_WINDOW_TITLE)) {
 
-    nk_layout_row_dynamic(ctx, 25, 1);
-    nk_property_int(ctx, "Lil Guys:", 0, &state.model.lil_guys_count,
-                    LIL_GUYS_MAX, 1, 0.005f);
+    // nk_layout_row_dynamic(ctx, 25, 1);
+    // nk_property_int(ctx, "Lil Guys:", 0, &state.model.lil_guys_count,
+    //                 LIL_GUYS_MAX, 1, 0.005f);
 
     nk_layout_row_dynamic(ctx, 25, 1);
     nk_label(ctx, "Background Clear Color:", NK_TEXT_LEFT);
@@ -441,6 +453,11 @@ static void gui_update() {
     }
   }
   nk_end(ctx);
+  if (nk_begin(ctx, "Statisics", nk_rect(290, 0, 260, 240),
+               NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE |
+                   NK_WINDOW_MINIMIZABLE | NK_WINDOW_TITLE)) {
+  }
+  nk_end(ctx);
 }
 
 // ----------------------------------------------------------------------------
@@ -450,9 +467,91 @@ static void model_reset() {
   // zeroth thing is always zeroed
   state.model.things_len = 1;
   state.model.things[0] = (thing_t){0};
+  memset(&state.cache.occupancy, 0,
+         sizeof(thing_id_t) * WORLD_SIZE_X * WORLD_SIZE_Y);
 
   firms_init();
   households_init();
+}
+
+static void model_tick() {
+  printf("model_tick 01\n");
+  // if (state.model.steps % config.model.month_length == 0) {
+  //   // TODO: month start
+  // } else if ((state.model.steps + 1) % config.model.month_length == 0) {
+  //   // TODO: month end
+  // }
+
+  // TODO: day tick
+
+  // TODO: log stats
+
+  // TEMP: move households around constantly
+  printf("model_tick 02\n");
+  for (int i = 0; i < state.model.things_len; i++) {
+    thing_t *thing = &state.model.things[i];
+    if (thing->flags & FLAG_HOUSEHOLD) {
+      thing_try_random_move(i);
+    }
+  }
+
+  state.model.steps++;
+}
+
+// ----------------------------------------------------------------------------
+// Things
+// ----------------------------------------------------------------------------
+static void things_draw() {
+  for (int i = 0; i < state.model.things_len; i++) {
+    thing_t *thing = &state.model.things[i];
+    size_t x = thing->world_x;
+    size_t y = thing->world_y;
+    if (thing->flags & FLAG_FIRM) {
+      state.gfx.pixels[x][y] = config.firm.color;
+    } else if (thing->flags & FLAG_HOUSEHOLD) {
+      state.gfx.pixels[x][y] = config.household.color;
+    }
+  }
+}
+
+static void thing_move_to(thing_id_t thing_id, size_t x, size_t y) {
+  printf("[debug] moving thing (%ld) to (%ld, %ld)\n", thing_id, x, y);
+  assert(state.cache.occupancy[x][y] == 0);
+  thing_t *thing = &state.model.things[thing_id];
+  assert(state.cache.occupancy[thing->world_x][thing->world_y] == thing_id);
+  state.cache.occupancy[thing->world_x][thing->world_y] = 0;
+  thing->world_x = x;
+  thing->world_y = y;
+  state.cache.occupancy[x][x] = thing_id;
+}
+inline static void thing_try_move_to(thing_id_t thing_id, size_t x, size_t y) {
+  if (state.cache.occupancy[x][y] != 0)
+    return;
+  thing_move_to(thing_id, x, y);
+}
+
+static void thing_place_randomly(thing_id_t thing_id) {
+  thing_t *thing = &state.model.things[thing_id];
+  size_t x, y, attempts = 0;
+  do {
+    x = rand() % WORLD_SIZE_X;
+    y = rand() % WORLD_SIZE_Y;
+    attempts++;
+  } while (state.cache.occupancy[x][y] > 0 && attempts < 2048);
+  assert(state.cache.occupancy[x][y] == 0);
+  thing->world_x = x;
+  thing->world_y = y;
+  state.cache.occupancy[x][y] = thing_id;
+  printf("[debug] placed thing (%ld) randomly at (%ld, %ld)\n", thing_id, x, y);
+}
+
+static void thing_try_random_move(thing_id_t thing_id) {
+  thing_t *thing = &state.model.things[thing_id];
+  int dx = (rand() % 3) - 2;
+  int dy = (rand() % 3) - 2;
+  int x = (thing->world_x + WORLD_SIZE_X + dx) % WORLD_SIZE_X;
+  int y = (thing->world_y + WORLD_SIZE_Y + dy) % WORLD_SIZE_Y;
+  thing_try_move_to(thing_id, x, y);
 }
 
 // ----------------------------------------------------------------------------
@@ -460,13 +559,12 @@ static void model_reset() {
 // ----------------------------------------------------------------------------
 static void firms_init() {
   for (int i = 0; i < config.firm.count; i++) {
-    assert(state.model.things_len < THINGS_MAX);
-    state.model.things[state.model.things_len] = (thing_t){
+    size_t idx = state.model.things_len;
+    assert(idx < THINGS_MAX);
+    state.model.things[idx] = (thing_t){
         .flags = FLAG_FIRM,
         .liquidity = config.firm.init_liquidity,
         .current_demand = config.firm.expected_demand,
-        .world_x = rand() % WORLD_SIZE_X,
-        .world_y = rand() % WORLD_SIZE_Y,
         .kind.firm =
             {
                 .goods_price = config.firm.init_goods_price,
@@ -475,9 +573,12 @@ static void firms_init() {
                 .monthly_revenue = 0,
             },
     };
+    thing_place_randomly(idx);
     state.model.things_len++;
   }
 }
+
+static void firms_update() {}
 
 // ----------------------------------------------------------------------------
 // Households
@@ -485,8 +586,9 @@ static void firms_init() {
 
 static void households_init() {
   for (int i = 0; i < config.household.count; i++) {
-    assert(state.model.things_len < THINGS_MAX);
-    state.model.things[state.model.things_len] = (thing_t){
+    size_t idx = state.model.things_len;
+    assert(idx < THINGS_MAX);
+    state.model.things[idx] = (thing_t){
         .flags = FLAG_HOUSEHOLD,
         .liquidity = config.household.init_liquidity,
         .current_demand = 0,
@@ -498,62 +600,11 @@ static void households_init() {
                 .reservation_wage = config.household.init_reservation_wage,
             },
     };
+    thing_place_randomly(idx);
     state.model.things_len++;
   }
 }
 
-// ----------------------------------------------------------------------------
-// Lil Guys
-// ----------------------------------------------------------------------------
-
-static void lil_guys_init() {
-  state.model.lil_guys_count = 4;
-  for (int i = 0; i < LIL_GUYS_MAX; i++) {
-    lil_guy_t *guy = &state.model.lil_guys[i];
-
-    guy->world_x = rand() % WORLD_SIZE_X;
-    guy->world_y = rand() % WORLD_SIZE_Y;
-
-    uint8_t r = rand();
-    uint8_t g = rand();
-    uint8_t b = rand();
-    uint8_t max_rgb = r > g ? r : g;
-    max_rgb = b > max_rgb ? b : max_rgb;
-    float scale = 255.0f / max_rgb;
-    guy->color.a = 0xFF;
-    guy->color.r = (uint8_t)(r * scale);
-    guy->color.g = (uint8_t)(g * scale);
-    guy->color.b = (uint8_t)(b * scale);
-  }
-}
-
-static void lil_guys_update() {
-  // update lil guys
-  for (int i = 0; i < state.model.lil_guys_count; i++) {
-    lil_guy_t *guy = &state.model.lil_guys[i];
-    guy->world_x =
-        (guy->world_x + WORLD_SIZE_X + (rand() % 3) - 1) % WORLD_SIZE_X;
-    guy->world_y =
-        (guy->world_y + WORLD_SIZE_Y + (rand() % 3) - 1) % WORLD_SIZE_Y;
-  }
-
-  // update pixels
-  double dt = sapp_frame_duration();
-
-  for (int x = 0; x < WORLD_SIZE_X; x++) {
-    for (int y = 0; y < WORLD_SIZE_Y; y++) {
-      rgba_t pixel = uint32_to_rgba(state.gfx.pixels[x][y]);
-      rgba_t bg_color = sg_color_to_rgba(state.gfx.bg_color);
-      pixel = rgba_blend(pixel, bg_color, dt * state.gfx.fade_speed);
-      state.gfx.pixels[x][y] = rgba_to_uint32(pixel);
-    }
-  }
-
-  for (int i = 0; i < state.model.lil_guys_count; i++) {
-    lil_guy_t *guy = &state.model.lil_guys[i];
-    state.gfx.pixels[guy->world_x][guy->world_y] = rgba_to_uint32(guy->color);
-  }
-}
 // ----------------------------------------------------------------------------
 // Config
 // ----------------------------------------------------------------------------
