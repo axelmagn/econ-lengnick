@@ -281,6 +281,7 @@ static void things_draw();
 static void thing_move_to(thing_id_t thing_id, size_t x, size_t y);
 static void thing_try_move_to(thing_id_t thing_id, size_t x, size_t y);
 static void thing_try_random_move(thing_id_t thing_id);
+static void things_validate_occupancy();
 
 // firms
 static void firms_init();
@@ -472,10 +473,15 @@ static void model_reset() {
 
   firms_init();
   households_init();
+  things_validate_occupancy();
 }
 
 static void model_tick() {
   printf("model_tick 01\n");
+
+  // tmp
+  things_validate_occupancy();
+
   // if (state.model.steps % config.model.month_length == 0) {
   //   // TODO: month start
   // } else if ((state.model.steps + 1) % config.model.month_length == 0) {
@@ -496,12 +502,14 @@ static void model_tick() {
   }
 
   state.model.steps++;
+  things_validate_occupancy();
 }
 
 // ----------------------------------------------------------------------------
 // Things
 // ----------------------------------------------------------------------------
 static void things_draw() {
+  memset(&state.gfx.pixels, 0, sizeof(uint32_t) * WORLD_SIZE_X * WORLD_SIZE_Y);
   for (int i = 0; i < state.model.things_len; i++) {
     thing_t *thing = &state.model.things[i];
     size_t x = thing->world_x;
@@ -515,15 +523,20 @@ static void things_draw() {
 }
 
 static void thing_move_to(thing_id_t thing_id, size_t x, size_t y) {
-  printf("[debug] moving thing (%ld) to (%ld, %ld)\n", thing_id, x, y);
+  printf("[debug] moving thing (%zu) to (%zu, %zu)\n", thing_id, x, y);
+  assert(thing_id > 0);
+  assert(thing_id < state.model.things_len);
+  assert(x < WORLD_SIZE_X);
+  assert(y < WORLD_SIZE_Y);
   assert(state.cache.occupancy[x][y] == 0);
   thing_t *thing = &state.model.things[thing_id];
   assert(state.cache.occupancy[thing->world_x][thing->world_y] == thing_id);
   state.cache.occupancy[thing->world_x][thing->world_y] = 0;
   thing->world_x = x;
   thing->world_y = y;
-  state.cache.occupancy[x][x] = thing_id;
+  state.cache.occupancy[x][y] = thing_id;
 }
+
 inline static void thing_try_move_to(thing_id_t thing_id, size_t x, size_t y) {
   if (state.cache.occupancy[x][y] != 0)
     return;
@@ -542,16 +555,36 @@ static void thing_place_randomly(thing_id_t thing_id) {
   thing->world_x = x;
   thing->world_y = y;
   state.cache.occupancy[x][y] = thing_id;
-  printf("[debug] placed thing (%ld) randomly at (%ld, %ld)\n", thing_id, x, y);
+  printf("[debug] placed thing (%zu) randomly at (%zu, %zu)\n", thing_id, x, y);
 }
 
 static void thing_try_random_move(thing_id_t thing_id) {
   thing_t *thing = &state.model.things[thing_id];
-  int dx = (rand() % 3) - 2;
-  int dy = (rand() % 3) - 2;
+  int dx = (rand() % 3) - 1;
+  int dy = (rand() % 3) - 1;
   int x = (thing->world_x + WORLD_SIZE_X + dx) % WORLD_SIZE_X;
   int y = (thing->world_y + WORLD_SIZE_Y + dy) % WORLD_SIZE_Y;
   thing_try_move_to(thing_id, x, y);
+}
+
+static void things_validate_occupancy() {
+  // validate thing -> occupancy mapping
+  for(size_t i = 1; i < state.model.things_len; i++) {
+    thing_t *thing = &state.model.things[i];
+    size_t x = thing->world_x;
+    size_t y = thing->world_y;
+    assert(state.cache.occupancy[x][y] == i);
+  }
+
+  // validate occupancy -> thing mapping
+  for(size_t x = 0; x < WORLD_SIZE_X; x++) {
+    for(size_t y = 0; y < WORLD_SIZE_Y; y++) {
+      thing_id_t id = state.cache.occupancy[x][y];
+      if (id == 0) continue;
+      assert(state.model.things[id].world_x == x);
+      assert(state.model.things[id].world_y == y);
+    }
+  }
 }
 
 // ----------------------------------------------------------------------------

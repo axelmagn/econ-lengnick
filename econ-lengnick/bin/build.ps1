@@ -20,27 +20,9 @@ if ($Help) {
     exit 0
 }
 
-$isLinux = if (Get-Variable -Name IsLinux -ErrorAction SilentlyContinue) { $IsLinux } else { $false }
-$isMacOS = if (Get-Variable -Name IsMacOS -ErrorAction SilentlyContinue) { $IsMacOS } else { $false }
-
-if ($isLinux) {
-    $shdcOs = "linux"
-    $shdcExe = "$TOOLS_DIR\sokol-shdc"
-    $nativeLibs = @("-lGL", "-lX11", "-lXi", "-lXcursor", "-lm", "-ldl")
-} elseif ($isMacOS) {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
-    if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
-        $shdcOs = "osx_arm64"
-    } else {
-        $shdcOs = "osx"
-    }
-    $shdcExe = "$TOOLS_DIR\sokol-shdc"
-    $nativeLibs = @("-framework", "Metal", "-framework", "MetalKit", "-framework", "Cocoa", "-framework", "QuartzCore", "-lm")
-} else {
-    $shdcOs = "win32"
-    $shdcExe = "$TOOLS_DIR\sokol-shdc.exe"
-    $nativeLibs = @("-lkernel32", "-luser32", "-lgdi32", "-ld3d11", "-ldxgi", "-lole32")
-}
+$shdcOs = "win32"
+$shdcExe = "$TOOLS_DIR\sokol-shdc.exe"
+$nativeLibs = @("-lkernel32", "-luser32", "-lgdi32", "-ld3d11", "-ldxgi", "-lole32")
 
 function Clean-BuildDir {
     Write-Host "==> Cleaning build directory..."
@@ -76,7 +58,7 @@ function Build-Native {
     $srcFile = "$SRC_DIR\main.c"
 
     $argsList = @(
-        "-std=c99", "-Wall", "-Wextra", "-O2",
+        "-std=c99", "-Wall", "-Wextra", "-g", "-O0",
         "-D_CRT_SECURE_NO_WARNINGS",
         "-I$INCLUDE_DIR",
         "-I$REPO_ROOT",
