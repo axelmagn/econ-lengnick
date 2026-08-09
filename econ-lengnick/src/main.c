@@ -44,7 +44,6 @@
 // CONSTANTS
 //
 // ============================================================================
-
 #define WORLD_SIZE_X (128)
 #define WORLD_SIZE_Y (128)
 
@@ -298,6 +297,7 @@ static rgba_t rgba_blend(rgba_t color1, rgba_t color2, float t);
 static rgba_t uint32_to_rgba(uint32_t color);
 static rgba_t sg_color_to_rgba(sg_color color);
 static uint32_t rgba_to_uint32(rgba_t color);
+static double rand_uniform(double min, double max);
 
 // ============================================================================
 //
@@ -569,7 +569,7 @@ static void thing_try_random_move(thing_id_t thing_id) {
 
 static void things_validate_occupancy() {
   // validate thing -> occupancy mapping
-  for(size_t i = 1; i < state.model.things_len; i++) {
+  for (size_t i = 1; i < state.model.things_len; i++) {
     thing_t *thing = &state.model.things[i];
     size_t x = thing->world_x;
     size_t y = thing->world_y;
@@ -577,14 +577,24 @@ static void things_validate_occupancy() {
   }
 
   // validate occupancy -> thing mapping
-  for(size_t x = 0; x < WORLD_SIZE_X; x++) {
-    for(size_t y = 0; y < WORLD_SIZE_Y; y++) {
+  for (size_t x = 0; x < WORLD_SIZE_X; x++) {
+    for (size_t y = 0; y < WORLD_SIZE_Y; y++) {
       thing_id_t id = state.cache.occupancy[x][y];
-      if (id == 0) continue;
+      if (id == 0)
+        continue;
       assert(state.model.things[id].world_x == x);
       assert(state.model.things[id].world_y == y);
     }
   }
+}
+
+static thing_t *things_iter_next(size_t *index, uint8_t flag_filter) {
+  assert(index != NULL);
+  while (*index < state.model.things_len &&
+         !(state.model.things[*index].flags & flag_filter)) {
+    *index = *index + 1;
+  }
+  return *index < state.model.things_len ? &state.model.things[*index] : NULL;
 }
 
 // ----------------------------------------------------------------------------
@@ -611,7 +621,18 @@ static void firms_init() {
   }
 }
 
-static void firms_update() {}
+// static void firm_set_wage_rate(thing_t *firm) {
+//   if (firm->flags & FLAG_OPEN_POSITION) {
+//     // raise wage
+//     firm->kind.firm.wage_rate *=
+//         1 + rand_uniform(0, config.firm.wage_adjustment_upper);
+//   } else if (firm->kind.firm.months_since_hire_failure >=
+//              config.firm.wage_reduction_months) {
+//     // lower wage
+//     firm->kind.firm.wage_rate *=
+//         1 - rand_uniform(0, config.firm.wage_adjustment_upper);
+//   }
+// }
 
 // ----------------------------------------------------------------------------
 // Households
@@ -680,4 +701,9 @@ static rgba_t sg_color_to_rgba(sg_color color) {
 
 static uint32_t rgba_to_uint32(rgba_t color) {
   return (color.a << 24) | (color.b << 16) | (color.g << 8) | color.r;
+}
+
+static double rand_uniform(double min, double max) {
+  assert(min < max);
+  return min + rand() / (double)RAND_MAX * (max - min);
 }
