@@ -248,7 +248,7 @@ static struct {
             .wage_reduction_months = 24,
             .wage_adjustment_upper = 0.019,
             .inventory_phi_upper = 1.0,
-            .inventory_phi_lower = 1.025,
+            .inventory_phi_lower = 0.25,
             .price_phi_upper = 1.15,
             .price_phi_lower = 1.025,
             .price_adjustment_upper = 0.02,
@@ -274,6 +274,7 @@ static void gui_update();
 // model
 static void model_reset();
 static void model_tick();
+static void model_tick_month_start();
 
 // things
 static void things_draw();
@@ -285,9 +286,12 @@ static void things_validate_occupancy();
 // firms
 static void firms_init();
 static void firms_update();
+static void firm_tick_month_start(thing_id_t firm_id);
 
 // households
 static void households_init();
+// static void household_tick_month_start(thing_id_t household_id);
+static void household_end_employment(thing_id_t household_id);
 
 // config
 static float config_marginal_cost_deflator();
@@ -505,6 +509,18 @@ static void model_tick() {
   things_validate_occupancy();
 }
 
+static void model_tick_month_start() {
+  for (int i = 1; i < state.model.things_len; i++) {
+    thing_t *thing = &state.model.things[i];
+    if (thing->flags & FLAG_FIRM) {
+      firm_tick_month_start(thing);
+    }
+    if (thing->flags & FLAG_HOUSEHOLD) {
+      // TODO: household month start stuff
+    }
+  }
+}
+
 // ----------------------------------------------------------------------------
 // Things
 // ----------------------------------------------------------------------------
@@ -621,18 +637,86 @@ static void firms_init() {
   }
 }
 
-// static void firm_set_wage_rate(thing_t *firm) {
-//   if (firm->flags & FLAG_OPEN_POSITION) {
-//     // raise wage
-//     firm->kind.firm.wage_rate *=
-//         1 + rand_uniform(0, config.firm.wage_adjustment_upper);
-//   } else if (firm->kind.firm.months_since_hire_failure >=
-//              config.firm.wage_reduction_months) {
-//     // lower wage
-//     firm->kind.firm.wage_rate *=
-//         1 - rand_uniform(0, config.firm.wage_adjustment_upper);
-//   }
-// }
+static void firm_set_wage_rate(thing_t *firm) {
+  if (firm->flags & FLAG_OPEN_POSITION) {
+    // raise wage
+    firm->kind.firm.wage_rate *=
+        1 + rand_uniform(0, config.firm.wage_adjustment_upper);
+  } else if (firm->kind.firm.months_since_hire_failure >=
+             config.firm.wage_reduction_months) {
+    // lower wage
+    firm->kind.firm.wage_rate *=
+        1 - rand_uniform(0, config.firm.wage_adjustment_upper);
+  }
+}
+
+static void firm_tick_month_start(thing_id_t firm_id) {
+  thing_t *firm = &state.model.things[firm_id];
+  // update wages
+  if (firm->flags & FLAG_OPEN_POSITION) {
+    firm->kind.firm.wage_rate *=
+        1 + rand_uniform(0, config.firm.wage_adjustment_upper);
+  } else if (firm->kind.firm.months_since_hire_failure >=
+             config.firm.wage_reduction_months) {
+    firm->kind.firm.wage_rate =
+        1 - rand_uniform(0, config.firm.wage_adjustment_upper);
+  }
+
+  // manage workforce
+  amount_t inventory = firm->kind.firm.inventory;
+  amount_t inventory_lower =
+      ceil(config.firm.inventory_phi_lower * firm->current_demand);
+  amount_t inventory_upper =
+      floor(config.firm.inventory_phi_upper * firm->current_demand);
+  // if inventory is too low, either cancel outstanding notice or offer a
+  // new position.
+  if (inventory < inventory_lower) {
+    firm->flags = FLAG_OPEN_POSITION * (firm->kind.firm.worker_on_notice == 0);
+    firm->kind.firm.worker_on_notice = 0;
+  }
+  // if a worker is on notice, fire them
+  thing_id_t worker_id = firm->kind.firm.worker_on_notice;
+  if (worker_id) {
+    thing_t *worker = &state.model.things[worker_id];
+    assert(worker->flags & FLAG_HOUSEHOLD);
+    assert(worker->kind.household.employer == firm_id);
+    household_end_employment(worker_id);
+  }
+  // if inventory is too high, give notice to a worker and cancel any open
+  // position
+  if (inventory > inventory_upper) {
+    worker_id = 0;
+    // TODO: pick a random worker (probably using some sort of intrusive
+    // list)
+    for (int i = 1; i < state.model.things_len; i++) {
+      thing_t *worker = &state.model.things[i];
+      if ((worker->flags & FLAG_HOUSEHOLD) &&
+          (worker->kind.household.employer == firm_id)) {
+        worker_id = i;
+        break;
+      }
+    }
+    firm->kind.firm.worker_on_notice = worker_id;
+    firm->flags &= ~FLAG_OPEN_POSITION;
+  }
+
+  // update goods price (random chance)
+  if (rand_uniform(0, 1) < config.firm.price_adjustment_prob) {
+    // if inventory low, raise prices
+    if (inventory < inventory_lower) {
+      firm->kind.firm.goods_price *=
+          1 + rand_uniform(0, config.firm.price_adjustment_upper);
+    }
+    // if inventory high, lower prices
+    if (inventory > inventory_upper) {
+      firm->kind.firm.goods_price *=
+          1 - rand_uniform(0, config.firm.price_adjustment_upper);
+    }
+  }
+
+  // reset monthly accumulators
+  firm->current_demand = 0;
+}
 
 // ----------------------------------------------------------------------------
 // Households
@@ -656,6 +740,21 @@ static void households_init() {
     };
     thing_place_randomly(idx);
     state.model.things_len++;
+  }
+}
+
+static void household_end_employment(thing_id_t household_id) {
+  assert(household_id < state.model.things_len);
+  thing_t *household = &state.model.things[household_id];
+  assert(household->flags & FLAG_HOUSEHOLD);
+  thing_id_t employer_id = household->kind.household.employer;
+  assert(employer_id > 0);
+  assert(employer_id < state.model.things_len);
+  thing_t *employer = &state.model.things[employer_id];
+  assert(employer->flags & FLAG_FIRM);
+  household->kind.household.employer = 0;
+  if (employer->kind.firm.worker_on_notice == household_id) {
+    employer->kind.firm.worker_on_notice = 0;
   }
 }
 
