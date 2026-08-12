@@ -72,6 +72,7 @@ typedef enum {
 
   // bools
   FLAG_OPEN_POSITION = (1 << 3),
+  FLAG_WANDERING = (1 << 4),
 } thing_flag_t;
 
 typedef struct {
@@ -89,6 +90,9 @@ typedef struct {
     struct {
       thing_id_t employer;
       currency_t reservation_wage;
+      amount_t months_since_employment;
+      amount_t months_since_paid_enough;
+      amount_t months_since_demand_met;
     } household;
     struct {
       /// the price of each item in the inventory
@@ -100,6 +104,11 @@ typedef struct {
       currency_t monthly_revenue;
       amount_t months_since_hire_failure;
       thing_id_t worker_on_notice;
+
+      // cached values
+      // counter tracking number of employees
+      amount_t num_employees;
+      currency_t wages_payable;
     } firm;
   } kind;
 } thing_t;
@@ -131,6 +140,7 @@ static struct {
     size_t things_len;
     thing_t things[THINGS_MAX];
 
+    currency_t dividends_payable;
   } model;
 
   struct {
@@ -180,11 +190,19 @@ static struct {
     /// new firm will be picked (zeta)
     float price_switching_threshold;
     /// probability of looking for firm with cheaper prices
-    float price_switching_prob;
+    float find_cheaper_prob;
     /// probability of replacing a firm that fails to supply
-    float quant_switching_prob;
+    float find_better_prob;
     /// how far around their position the household can see when searching
     float visibility_radius;
+    /// number of months until household will wander due to unemployment
+    amount_t wander_employment_months;
+    /// probability that household will wander due to unemployment
+    float wander_employment_prob;
+    /// number of months until household will wander due to unmet demand
+    amount_t wander_demand_months;
+    /// probability that household will wander due to unment demand
+    float wander_demand_prob;
   } household;
 
   struct {
@@ -221,6 +239,11 @@ static struct {
     float reserved_income_multiple;
   } firm;
 } config = {
+    .model =
+        {
+            .labor_supply = 1.0f,
+            .month_length = 28,
+        },
     .household =
         {
             .count = 128,
@@ -231,9 +254,13 @@ static struct {
             .consumption_expenditure_decay = 0.9f,
             .employed_search_probability = 0.1f,
             .price_switching_threshold = 0.01f,
-            .price_switching_prob = 0.25f,
-            .quant_switching_prob = 0.25f,
+            .find_cheaper_prob = 0.25f,
+            .find_better_prob = 0.25f,
             .visibility_radius = 8,
+            .wander_employment_months = 24,
+            .wander_employment_prob = .5,
+            .wander_demand_months = 12,
+            .wander_demand_prob = .5,
         },
 
     .firm =
@@ -275,6 +302,8 @@ static void gui_update();
 static void model_reset();
 static void model_tick();
 static void model_tick_month_start();
+static void model_tick_month_end();
+static void model_tick_day();
 
 // things
 static void things_draw();
@@ -287,10 +316,15 @@ static void things_validate_occupancy();
 static void firms_init();
 static void firms_update();
 static void firm_tick_month_start(thing_id_t firm_id);
+static void firm_tick_month_end(thing_id_t firm_id);
+static void firm_tick_day(thing_id_t firm_id);
 
 // households
 static void households_init();
-// static void household_tick_month_start(thing_id_t household_id);
+static void household_tick_month_start(thing_id_t household_id);
+static void household_tick_month_end(thing_id_t household_id);
+static void household_tick_day(thing_id_t household_id);
+
 static void household_end_employment(thing_id_t household_id);
 
 // config
@@ -513,7 +547,20 @@ static void model_tick_month_start() {
   for (int i = 1; i < state.model.things_len; i++) {
     thing_t *thing = &state.model.things[i];
     if (thing->flags & FLAG_FIRM) {
-      firm_tick_month_start(thing);
+      firm_tick_month_start(i);
+    }
+    if (thing->flags & FLAG_HOUSEHOLD) {
+      // TODO: household month start stuff
+    }
+  }
+}
+
+static void model_tick_month_end() {
+  state.model.dividends_payable = 0;
+  for (int i = 1; i < state.model.things_len; i++) {
+    thing_t *thing = &state.model.things[i];
+    if (thing->flags & FLAG_FIRM) {
+      firm_tick_month_end(i);
     }
     if (thing->flags & FLAG_HOUSEHOLD) {
       // TODO: household month start stuff
@@ -718,6 +765,52 @@ static void firm_tick_month_start(thing_id_t firm_id) {
   firm->current_demand = 0;
 }
 
+static void firm_tick_month_end(thing_id_t firm_id) {
+  thing_t *firm = &state.model.things[firm_id];
+  assert(firm->flags & FLAG_FIRM);
+  // adjust wages
+  currency_t total_wages =
+      firm->kind.firm.wage_rate * firm->kind.firm.num_employees;
+  bool cant_pay_workers = firm->liquidity < total_wages;
+  if (cant_pay_workers) {
+    firm->kind.firm.wage_rate = firm->liquidity / firm->kind.firm.num_employees;
+    total_wages = firm->kind.firm.wage_rate * firm->kind.firm.num_employees;
+  }
+  assert(total_wages <= firm->liquidity);
+
+  // move wages to accounts payable
+  // wages will be collected by households after all firms have ticked
+  firm->liquidity -= total_wages;
+  firm->kind.firm.wages_payable += total_wages;
+
+  currency_t reserved_buffer =
+      firm->kind.firm.monthly_revenue * config.firm.reserved_income_multiple;
+  if (reserved_buffer < firm->liquidity) {
+    currency_t dividend = firm->liquidity - reserved_buffer;
+    state.model.dividends_payable += dividend;
+    firm->liquidity -= dividend;
+  }
+
+  // TODO: check for hire failures
+  if (firm->flags & FLAG_OPEN_POSITION) {
+    firm->kind.firm.months_since_hire_failure += 1;
+  } else {
+    firm->kind.firm.months_since_hire_failure = 0;
+  }
+
+  // reset counters
+  firm->kind.firm.monthly_revenue = 0;
+}
+
+static void firm_tick_day(thing_id_t firm_id) {
+  thing_t *firm = &state.model.things[firm_id];
+  assert(firm->flags & FLAG_FIRM);
+  // produce output
+  float labor_power = firm->kind.firm.num_employees * config.model.labor_supply;
+  amount_t production_amount = labor_power * config.firm.productivity_multiple;
+  firm->kind.firm.inventory += production_amount;
+}
+
 // ----------------------------------------------------------------------------
 // Households
 // ----------------------------------------------------------------------------
@@ -743,6 +836,26 @@ static void households_init() {
   }
 }
 
+static void household_tick_month_start(thing_id_t household_id) {
+  thing_t *household = &state.model.things[household_id];
+
+  // households decide to wander based on whether their employment and goods
+  // needs are being met - they keep track of how long they have been unemployed
+  // or underserved, and when these cross a threshold, there is a probability
+  // that they will wander until both employment and goods can be found.
+  bool should_wander =
+      household->kind.household.months_since_employment >=
+          config.household.wander_employment_months &&
+      rand_uniform(0, 1) < config.household.wander_employment_prob;
+  should_wander = should_wander ||
+                  household->kind.household.months_since_demand_met >=
+                          config.household.wander_demand_months &&
+                      rand_uniform(0, 1) < config.household.wander_demand_prob;
+  if (should_wander) {
+    household->flags |= FLAG_WANDERING;
+  }
+}
+
 static void household_end_employment(thing_id_t household_id) {
   assert(household_id < state.model.things_len);
   thing_t *household = &state.model.things[household_id];
@@ -756,6 +869,8 @@ static void household_end_employment(thing_id_t household_id) {
   if (employer->kind.firm.worker_on_notice == household_id) {
     employer->kind.firm.worker_on_notice = 0;
   }
+  assert(employer->kind.firm.num_employees > 0);
+  employer->kind.firm.num_employees--;
 }
 
 // ----------------------------------------------------------------------------
