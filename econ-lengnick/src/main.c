@@ -50,6 +50,8 @@
 #define THINGS_MAX (8192)
 #define EVENTS_MAX (1024)
 
+#define VISIBILITY_MEMO_MAX (8)
+
 // ============================================================================
 //
 // TYPES
@@ -72,7 +74,7 @@ typedef enum {
 
   // bools
   FLAG_OPEN_POSITION = (1 << 3),
-  FLAG_WANDERING = (1 << 4),
+  FLAG_WANDER = (1 << 4),
 } thing_flag_t;
 
 typedef struct {
@@ -90,9 +92,7 @@ typedef struct {
     struct {
       thing_id_t employer;
       currency_t reservation_wage;
-      amount_t months_since_employment;
-      amount_t months_since_paid_enough;
-      amount_t months_since_demand_met;
+      amount_t unsatisfied_demand;
     } household;
     struct {
       /// the price of each item in the inventory
@@ -121,10 +121,9 @@ typedef struct {
 } rgba_t;
 
 typedef struct {
-  size_t world_x;
-  size_t world_y;
-  rgba_t color;
-} lil_guy_t;
+  thing_id_t thing_id;
+  uint64_t distance_sq;
+} visibility_memo_t;
 
 // ============================================================================
 //
@@ -145,6 +144,8 @@ static struct {
 
   struct {
     thing_id_t occupancy[WORLD_SIZE_X][WORLD_SIZE_Y];
+    visibility_memo_t visibility[WORLD_SIZE_X][WORLD_SIZE_Y]
+                                [VISIBILITY_MEMO_MAX];
   } cache;
 
   // graphics context
@@ -194,15 +195,13 @@ static struct {
     /// probability of replacing a firm that fails to supply
     float find_better_prob;
     /// how far around their position the household can see when searching
-    float visibility_radius;
-    /// number of months until household will wander due to unemployment
-    amount_t wander_employment_months;
+    size_t visibility_radius;
     /// probability that household will wander due to unemployment
-    float wander_employment_prob;
-    /// number of months until household will wander due to unmet demand
-    amount_t wander_demand_months;
-    /// probability that household will wander due to unment demand
-    float wander_demand_prob;
+    float wander_unemployed_prob;
+    /// probability that household will wander due to unmet demand
+    float wander_underserved_prob;
+    /// probability that household will wander due to being underpaid
+    float wander_underpaid_prob;
   } household;
 
   struct {
@@ -257,10 +256,9 @@ static struct {
             .find_cheaper_prob = 0.25f,
             .find_better_prob = 0.25f,
             .visibility_radius = 8,
-            .wander_employment_months = 24,
-            .wander_employment_prob = .5,
-            .wander_demand_months = 12,
-            .wander_demand_prob = .5,
+            .wander_unemployed_prob = .5,
+            .wander_underserved_prob = .5,
+            .wander_underpaid_prob = .2,
         },
 
     .firm =
@@ -327,6 +325,9 @@ static void household_tick_day(thing_id_t household_id);
 
 static void household_end_employment(thing_id_t household_id);
 
+// cache
+static void cache_update_visibility();
+
 // config
 static float config_marginal_cost_deflator();
 
@@ -355,7 +356,6 @@ static void init(void) {
 }
 
 static void frame() {
-  printf("frame\n");
   model_tick();
 
   gui_update();
@@ -508,15 +508,20 @@ static void model_reset() {
   state.model.things[0] = (thing_t){0};
   memset(&state.cache.occupancy, 0,
          sizeof(thing_id_t) * WORLD_SIZE_X * WORLD_SIZE_Y);
+  memset(&state.cache.visibility, 0,
+         sizeof(visibility_memo_t) * WORLD_SIZE_X * WORLD_SIZE_Y *
+             VISIBILITY_MEMO_MAX);
 
   firms_init();
   households_init();
+
   things_validate_occupancy();
+
+  // update visibility cache so that it can be used by household ticks
+  cache_update_visibility();
 }
 
 static void model_tick() {
-  printf("model_tick 01\n");
-
   // tmp
   things_validate_occupancy();
 
@@ -531,7 +536,6 @@ static void model_tick() {
   // TODO: log stats
 
   // TEMP: move households around constantly
-  printf("model_tick 02\n");
   for (int i = 0; i < state.model.things_len; i++) {
     thing_t *thing = &state.model.things[i];
     if (thing->flags & FLAG_HOUSEHOLD) {
@@ -572,8 +576,36 @@ static void model_tick_month_end() {
 // Things
 // ----------------------------------------------------------------------------
 static void things_draw() {
-  memset(&state.gfx.pixels, 0, sizeof(uint32_t) * WORLD_SIZE_X * WORLD_SIZE_Y);
-  for (int i = 0; i < state.model.things_len; i++) {
+  rgba_t bg_color = sg_color_to_rgba(state.gfx.bg_color);
+  memset(&state.gfx.pixels, rgba_to_uint32(bg_color),
+         sizeof(uint32_t) * WORLD_SIZE_X * WORLD_SIZE_Y);
+
+  // render firm visibility heatmap
+  // TODO: this doesn't need to be recomputed every frame
+  // TODO: add UI checkbox
+  rgba_t firm_color = uint32_to_rgba(config.firm.color);
+  for (size_t x = 0; x < WORLD_SIZE_X; x++) {
+    for (size_t y = 0; y < WORLD_SIZE_Y; y++) {
+      size_t num_visible = 0;
+      for (size_t k = 0; k < VISIBILITY_MEMO_MAX; k++) {
+        if (state.cache.visibility[x][y][k].thing_id > 0) {
+          num_visible++;
+        }
+      }
+
+      // printf("num visible: (%zu, %zu) -> %zu\n", x, y, num_visible);
+
+      float blend = (float)num_visible / 4;
+      blend = blend > 1.0 ? 1.0 : blend;
+      rgba_t color = rgba_blend(bg_color, firm_color, blend);
+      color.a = 0xFF;
+
+      state.gfx.pixels[x][y] = rgba_to_uint32(color);
+    }
+  }
+
+  // render firms and households
+  for (size_t i = 0; i < state.model.things_len; i++) {
     thing_t *thing = &state.model.things[i];
     size_t x = thing->world_x;
     size_t y = thing->world_y;
@@ -586,7 +618,7 @@ static void things_draw() {
 }
 
 static void thing_move_to(thing_id_t thing_id, size_t x, size_t y) {
-  printf("[debug] moving thing (%zu) to (%zu, %zu)\n", thing_id, x, y);
+  // printf("[debug] moving thing (%zu) to (%zu, %zu)\n", thing_id, x, y);
   assert(thing_id > 0);
   assert(thing_id < state.model.things_len);
   assert(x < WORLD_SIZE_X);
@@ -606,19 +638,22 @@ inline static void thing_try_move_to(thing_id_t thing_id, size_t x, size_t y) {
   thing_move_to(thing_id, x, y);
 }
 
-static void thing_place_randomly(thing_id_t thing_id) {
+static void thing_place(thing_id_t thing_id, size_t x, size_t y) {
   thing_t *thing = &state.model.things[thing_id];
+  assert(state.cache.occupancy[x][y] == 0);
+  thing->world_x = x;
+  thing->world_y = y;
+  state.cache.occupancy[x][y] = thing_id;
+}
+
+static void thing_place_randomly(thing_id_t thing_id) {
   size_t x, y, attempts = 0;
   do {
     x = rand() % WORLD_SIZE_X;
     y = rand() % WORLD_SIZE_Y;
     attempts++;
   } while (state.cache.occupancy[x][y] > 0 && attempts < 2048);
-  assert(state.cache.occupancy[x][y] == 0);
-  thing->world_x = x;
-  thing->world_y = y;
-  state.cache.occupancy[x][y] = thing_id;
-  printf("[debug] placed thing (%zu) randomly at (%zu, %zu)\n", thing_id, x, y);
+  thing_place(thing_id, x, y);
 }
 
 static void thing_try_random_move(thing_id_t thing_id) {
@@ -843,16 +878,139 @@ static void household_tick_month_start(thing_id_t household_id) {
   // needs are being met - they keep track of how long they have been unemployed
   // or underserved, and when these cross a threshold, there is a probability
   // that they will wander until both employment and goods can be found.
-  bool should_wander =
-      household->kind.household.months_since_employment >=
-          config.household.wander_employment_months &&
-      rand_uniform(0, 1) < config.household.wander_employment_prob;
-  should_wander = should_wander ||
-                  household->kind.household.months_since_demand_met >=
-                          config.household.wander_demand_months &&
-                      rand_uniform(0, 1) < config.household.wander_demand_prob;
-  if (should_wander) {
-    household->flags |= FLAG_WANDERING;
+  // TODO: underserved logic
+  thing_id_t employer_id = household->kind.household.employer;
+  thing_t *employer = &state.model.things[employer_id];
+  bool is_employed = employer_id > 0;
+  bool is_underpaid =
+      is_employed && employer->kind.firm.wage_rate <
+                         household->kind.household.reservation_wage;
+
+  bool wander;
+  if (!is_employed) {
+    wander |= rand_uniform(0, 1) < config.household.wander_unemployed_prob;
+  }
+  if (is_underpaid) {
+    wander |= rand_uniform(0, 1) < config.household.wander_underpaid_prob;
+  }
+  if (wander) {
+    household->flags |= FLAG_WANDER;
+  }
+
+  // plan consumption
+  size_t num_suppliers = 0;
+  if (num_suppliers > 0) {
+    amount_t total_goods_price = 0;
+    size_t x = household->world_x;
+    size_t y = household->world_y;
+    for (int i = 0; i < VISIBILITY_MEMO_MAX; i++) {
+      thing_id_t supplier_id = state.cache.visibility[x][y][i].thing_id;
+      if (supplier_id > 0) {
+        thing_t *supplier = &state.model.things[supplier_id];
+        assert(supplier->flags & FLAG_FIRM);
+        total_goods_price += supplier->kind.firm.goods_price;
+        num_suppliers++;
+      }
+    }
+    float avg_good_price = (float)total_goods_price / (float)num_suppliers;
+    float planned_consumption =
+        pow(household->liquidity / avg_good_price,
+            config.household.consumption_expenditure_decay);
+    household->current_demand = planned_consumption;
+  }
+}
+
+static void household_tick_month_end(thing_id_t household_id) {
+  thing_t *household = &state.model.things[household_id];
+  assert(household->flags & FLAG_HOUSEHOLD);
+
+  // adjust reservation wage
+  thing_id_t employer_id = household->kind.household.employer;
+  thing_t *employer = &state.model.things[employer_id];
+  amount_t *reservation_wage = &household->kind.household.reservation_wage;
+  if (employer_id) {
+    amount_t employer_wage = employer->kind.firm.wage_rate;
+    *reservation_wage =
+        employer_wage > *reservation_wage ? employer_wage : *reservation_wage;
+  } else {
+    *reservation_wage *=
+        *reservation_wage * config.household.unemployed_wage_decay_rate;
+  }
+}
+
+static void household_tick_day(thing_id_t household_id) {
+  thing_t *household = &state.model.things[household_id];
+  assert(household->flags & FLAG_HOUSEHOLD);
+
+  // buy goods
+
+  // count visible firms
+  size_t num_visible_firms = 0;
+  size_t x = household->world_x;
+  size_t y = household->world_y;
+  for (size_t i = 0; i < VISIBILITY_MEMO_MAX; i++) {
+    if (state.cache.visibility[x][y][i].thing_id > 0) {
+      num_visible_firms++;
+    }
+  }
+
+  // sample supplier from those visible (for fairness)
+  amount_t satisfied_demand = 0;
+  amount_t required_amount = household->current_demand;
+  amount_t satisfaction_amount =
+      required_amount * (1.0 - config.household.satisfaction_fraction);
+  for (size_t i = 0; num_visible_firms > 0 && i < VISIBILITY_MEMO_MAX; i++) {
+    size_t j = rand() % num_visible_firms;
+    visibility_memo_t *memo = &state.cache.visibility[x][y][0];
+
+    // seek next valid memo
+    for (int i = 0; memo->thing_id == 0 && i < VISIBILITY_MEMO_MAX; i++) {
+      memo++;
+    }
+
+    while (j > 0) {
+      memo++;
+
+      for (int i = 0; memo->thing_id == 0 && i < VISIBILITY_MEMO_MAX; i++) {
+        memo++;
+      }
+
+      j--;
+    }
+
+    assert(memo->thing_id > 0);
+
+    // transact
+    //
+    // TODO: something is fucked with current demand and planning.  need to
+    // revisit and reason it out when I don't have brain fog
+    //
+    thing_id_t supplier_id = memo->thing_id;
+    thing_t *supplier = &state.model.things[supplier_id];
+    assert(supplier->flags & FLAG_FIRM);
+    amount_t transaction_amount = required_amount;
+    amount_t available_amount = supplier->kind.firm.inventory;
+    if (available_amount < transaction_amount) {
+      transaction_amount = available_amount;
+    }
+    currency_t goods_price = supplier->kind.firm.goods_price;
+    amount_t affordable_amount = household->liquidity / goods_price;
+    if (affordable_amount < transaction_amount) {
+      transaction_amount = affordable_amount;
+    }
+    currency_t transaction_price = transaction_amount * goods_price;
+    assert(transaction_price <= household->liquidity);
+    assert(transaction_amount <= supplier->kind.firm.inventory);
+    supplier->kind.firm.inventory -= transaction_amount;
+    supplier->liquidity += transaction_price;
+    household->liquidity -= transaction_price;
+    required_amount -= transaction_amount;
+  }
+
+  // TODO: record unsatisfied demand
+  if (required_amount > satisfaction_amount) {
+    household->kind.household.unsatisfied_demand +=
+        required_amount - satisfaction_amount;
   }
 }
 
@@ -871,6 +1029,61 @@ static void household_end_employment(thing_id_t household_id) {
   }
   assert(employer->kind.firm.num_employees > 0);
   employer->kind.firm.num_employees--;
+}
+
+// ----------------------------------------------------------------------------
+// Cache
+// ----------------------------------------------------------------------------
+static void cache_update_visibility() {
+  // clear visibility cache
+  memset(state.cache.visibility, 0,
+         sizeof(visibility_memo_t) * WORLD_SIZE_X * WORLD_SIZE_Y *
+             VISIBILITY_MEMO_MAX);
+  for (size_t i = 0; i < state.model.things_len; i++) {
+    thing_t *thing = &state.model.things[i];
+    // only operate on firms
+    if (!(thing->flags & FLAG_FIRM))
+      continue;
+
+    size_t radius = config.household.visibility_radius;
+    size_t radius_sq = radius * radius;
+
+    // printf("adding firm (%zu) to visibility cache (radius_sq: %zu)\n", i,
+    // radius_sq);
+
+    for (int64_t dx = -radius; dx <= (int64_t)radius; dx++) {
+      for (int64_t dy = -radius; dy <= (int64_t)radius; dy++) {
+        if (dx == 0 && dy == 0)
+          continue;
+
+        size_t distance_sq = (dx * dx + dy * dy);
+        if (distance_sq > radius_sq)
+          continue;
+
+        size_t x = (thing->world_x + WORLD_SIZE_X + dx) % WORLD_SIZE_X;
+        size_t y = (thing->world_y + WORLD_SIZE_Y + dy) % WORLD_SIZE_Y;
+        visibility_memo_t *farthest = &state.cache.visibility[x][y][0];
+        for (size_t j = 0; j < VISIBILITY_MEMO_MAX; j++) {
+          assert(x < WORLD_SIZE_X);
+          assert(y < WORLD_SIZE_Y);
+          visibility_memo_t *memo = &state.cache.visibility[x][y][j];
+          if (memo->thing_id == 0) {
+            farthest = memo;
+            break;
+          }
+          if (memo->distance_sq > farthest->distance_sq) {
+            farthest = memo;
+          }
+        }
+        if (farthest->thing_id == 0 || farthest->distance_sq > distance_sq) {
+          farthest->thing_id = i;
+          farthest->distance_sq = distance_sq;
+          // printf("adding (%zu) to visibility cache at (%zu, %zu)\n", i, x,
+          // y);
+        }
+      }
+    }
+  }
 }
 
 // ----------------------------------------------------------------------------
