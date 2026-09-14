@@ -5,11 +5,112 @@ const Goods = u32;
 /// Nominal currency amount used as the medium of exchange.
 const Currency = i32;
 
+const Vec2 = @Vector(2, i32);
+
 const currency_resolution = 1000;
+
+const App = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+
+    model: Model = .{},
+    config: struct {
+        model: Model.Config = .{},
+        firm: Firm.Config = .{},
+        household: Household.Config = .{},
+    } = .{},
+    cache: struct {
+        firm: Firm.Table.Slice = .empty,
+        household: Household.Table.Slice = .empty,
+    } = .{},
+
+    fn init(gpa: std.mem.Allocator, io: std.Io) App {
+        const app = App{ .gpa = gpa, .io = io };
+        app.model.firms.ensureTotalCapacity(gpa, app.config.model.num_firms);
+        app.model.households.ensureTotalCapacity(gpa, app.config.model.num_households);
+    }
+};
+
+const lane = struct {
+    threadlocal var lane_idx: u8 = 0;
+    threadlocal var lane_count: u8 = 1;
+    threadlocal var barrier: *Barrier = undefined;
+    threadlocal var arena: std.heap.ArenaAllocator = undefined;
+
+    var shared_storage: u64 = 0;
+
+    const Range = struct {
+        min: usize,
+        len: usize,
+    };
+
+    const Barrier = struct {
+        count: std.atomic.Value(u8) = 0,
+        generation: std.atomic.Value(usize) = 0,
+        total: u8 = 1,
+
+        pub fn init(total: u8) Barrier {
+            std.debug.assert(total > 0);
+            return .{
+                .count = std.atomic.Value(u8).init(total),
+                .generation = std.atomic.Value(usize).init(0),
+                .total = total,
+            };
+        }
+
+        pub fn sync(self: *Barrier) void {
+            // snapshot the current generation
+            const gen = self.generation.load(.acquire);
+
+            // announce arrival
+            const old = self.count.fetchSub(1, .acq_rel);
+
+            if (old == 1) {
+                // last arrival - re-arm for next round before flipping generation
+                self.count.store(self.total, .release);
+                self.generation.store(gen + 1, .release);
+            } else {
+                while (self.generation.load(.acquire) == gen) {
+                    std.atomic.spinLoopHint();
+                }
+            }
+        }
+    };
+
+    fn sync() void {
+        if (lane_count > 1) {
+            barrier.sync();
+        }
+    }
+
+    fn sync_u64(value_ptr: *u64, source_lane_idx: u8) void {
+        if (lane_idx == source_lane_idx) shared_storage = value_ptr.*;
+        sync();
+        if (lane_idx != source_lane_idx) value_ptr.* = shared_storage;
+        sync();
+    }
+
+    fn sync_ptr(value_ptr: anytype, source_lane_idx: u8) void {
+        sync_u64(@ptrCast(value_ptr), source_lane_idx);
+    }
+
+    fn range(count: usize) Range {
+        const lane_count_usize = @as(usize, lane_count);
+        const lane_idx_usize = @as(usize, lane_idx);
+        const values_per_lane = @divTrunc(count, lane_count_usize);
+        const leftover_values = @mod(count, lane_count_usize);
+        const has_leftovers = lane_idx_usize < leftover_values;
+        const leftovers_before = if (has_leftovers) lane_idx_usize else leftover_values;
+        const min = values_per_lane * lane_idx_usize + leftovers_before;
+        const len = values_per_lane + @intFromBool(has_leftovers);
+        return .{ .min = min, .len = len };
+    }
+};
 
 /// Central macroeconomic model state and global configuration.
 const Model = struct {
-    // TODO: model state
+    firms: Firm.Table = .empty,
+    households: Household.Table = .empty,
 
     /// Global model parameters and calibration settings.
     const Config = struct {
@@ -26,14 +127,15 @@ const Model = struct {
         burn_in_months: u32 = 1000,
         /// Total fixed money supply circulating throughout the closed economy.
         total_money_stock: Currency = 100_000 * currency_resolution,
-
         /// reference to first employee in intrusive linked list
-        employees_head: Household.Id,
+        employees_head: Household.Id = 0,
     };
 };
 
 /// Household agent that supplies labor, earns wages and profit shares, and purchases goods.
 const Household = struct {
+    /// position in the world map
+    position: Vec2,
     /// Current cash balance held by the household, subject to cash-in-advance constraints.
     liquidity: Currency,
     /// Minimum acceptable monthly wage required to accept employment.
@@ -46,8 +148,6 @@ const Household = struct {
     /// Planned volume of real goods to consume over the current month, based
     /// on cash holdings, average prices, and consumption preferences.
     monthly_planned_consumption: Goods,
-
-
     /// reference to next coworker in intrusive linked list
     employees_next: Household.Id,
 
@@ -85,13 +185,17 @@ const Household = struct {
         /// Initial reservation wage assigned to households at the start of the simulation.
         initial_reservation_wage: Currency = 1 * currency_resolution,
         // DERIVE: distribute initial money between all households
-        // initial_household_liquidity: Currency = 10000, 
+        // initial_household_liquidity: Currency = 10000,
     };
+
+    const Table = std.MultiArrayList(Household);
 };
 
 /// Firm agent that hires workers, produces goods, manages inventory, sets
 /// prices and wages, and distributes profits.
 const Firm = struct {
+    /// position in the world map
+    position: Vec2,
     /// Operating cash balance accumulating sales revenue, deducted for monthly
     /// wages, and reset to zero during profit redistribution.
     liquidity: Currency,
@@ -106,7 +210,8 @@ const Firm = struct {
     /// Indicates whether the firm has an open job vacancy posted for the current month.
     open_position: bool,
     /// Indicates whether the firm had an open position last month that remained unfilled.
-    unfilled_positions_last_month: bool,
+    // (I think I can reuse open_position instead)
+    // unfilled_positions_last_month: bool,
     /// Number of consecutive months the firm has operated with all positions
     /// fully staffed without unfilled vacancies.
     consecutive_full_months: u32,
@@ -156,9 +261,21 @@ const Firm = struct {
         // initial_demand_history: Goods = 630 // DERIVE: exactly 1 month of normal production
         // initial_consecutive_full: u32 = 24 // DERIVE: same as employment memory
     };
-};
 
+    const Table = std.MultiArrayList(Firm);
+};
 
 // TODO: supplier relation
 
 // TODO: constrained firm relation
+
+const systems = struct {
+    /// each firm evaluates its staffing conditions, and possibly adjusts wages
+    fn wage_review() void {
+        const firms_range = lane.range(app.cache.firms.len);
+        const firms_slice = ctx.cache.firms.subslice(
+            firms_range.min,
+            firms_range.len,
+        );
+    }
+};
