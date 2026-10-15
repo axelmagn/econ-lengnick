@@ -10,11 +10,11 @@ const Household = @This();
 
 liquidity: Currency,
 reservation_wage: Currency,
-employer: ?Firm.Id,
-planned_consumption: Goods,
+employer: ?Firm.Id = null,
+planned_consumption: Goods = 0, // overwritten on month start
 
 // intrusive list: employer's employees
-employees_next: ?Household.Id,
+employees_next: ?Household.Id = null,
 
 // related:
 // suppliers - separate table
@@ -25,6 +25,9 @@ pub const Table = std.MultiArrayList(@This());
 
 pub const Config = struct {
     num_households: usize = 1000,
+    initial_liquidity: Currency = .from(3000),
+    initial_reservation_wage: Currency = .zero,
+
     max_suppliers: usize = 7,
     price_search_prob: f32 = 0.25,
     price_switch_threshold: f32 = 0.01,
@@ -33,6 +36,22 @@ pub const Config = struct {
     satisfied_search_prob: f32 = 0.1,
     consumption_exp: f32 = 0.9,
 };
+
+pub fn populate(
+    gpa: Allocator,
+    table: *Table,
+    config: *const Config,
+) Allocator.Error!void {
+    table.clearRetainingCapacity();
+    try table.ensureTotalCapacity(gpa, config.num_households);
+    for (0..config.num_households) |_| {
+        const household: Household = .{
+            .liquidity = config.initial_liquidity,
+            .reservation_wage = config.initial_reservation_wage,
+        };
+        table.appendAssumeCapacity(household);
+    }
+}
 
 /// calculate the average supplier price and number of suppliers for every household.
 fn calc_supplier_avg_prices_and_counts(
