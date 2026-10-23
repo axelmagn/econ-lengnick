@@ -1,3 +1,0 @@
--Ideps/include
--I.
--std=c99
