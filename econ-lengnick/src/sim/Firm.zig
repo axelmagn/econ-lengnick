@@ -7,7 +7,6 @@ const Firm = @This();
 const Goods = units.Goods;
 const Money = units.Money;
 
-
 liquidity: Money,
 inventory: Goods,
 price: Money,
@@ -53,4 +52,3 @@ pub const Config = struct {
     /// χ: liquidity buffer as a fraction of the wage bill.
     buffer_ratio: f64 = 0.1,
 };
-

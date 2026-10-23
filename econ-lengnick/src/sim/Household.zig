@@ -13,13 +13,8 @@ liquidity: Money,
 reservation_wage: Money,
 /// Type-B connection; null when unemployed.
 employer: ?Firm.Id = null,
-/// c_h^r: real consumption planned for the month.
-planned_consumption: Goods,
 /// ⌊c_h^r / num_days⌋: units to buy each day this month.
 daily_demand: Goods,
-
-/// intrusive list: firm employees
-employees_next: ?Household.Id = null,
 
 pub const Id = u32;
 pub const Table = std.MultiArrayList(Household);
@@ -48,5 +43,3 @@ pub const Config = struct {
     /// Reservation-wage cut after a month of unemployment (p.109).
     wage_decay_rate: f64 = 0.1,
 };
-
-

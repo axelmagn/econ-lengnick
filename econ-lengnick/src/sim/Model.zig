@@ -2,9 +2,12 @@ const std = @import("std");
 const Firm = @import("Firm.zig");
 const Household = @import("Household.zig");
 const SupplierLink = @import("SupplierLink.zig");
+const units = @import("units.zig");
+
+const Money = units.Money;
+const Goods = units.Goods;
 
 const Model = @This();
-
 
 config: Config,
 
@@ -42,14 +45,14 @@ pub const Config = struct {
     /// Initial values. Not defined in the paper (p.109 says only "initial
     /// values"); these are the newwayland/baseline-economy choices (§4).
     pub const Init = struct {
-        household_liquidity: u32 = 3100,
-        household_reservation_wage: u32 = 0,
-        firm_liquidity: u32 = 0,
-        firm_price: u32 = 25,
+        household_liquidity: Money = 3100,
+        household_reservation_wage: Money = 0,
+        firm_liquidity: Money = 0,
+        firm_price: Money = 25,
         /// Daily rate; the monthly wage is this times `num_days`.
-        firm_daily_wage: u32 = 68,
-        firm_inventory: u32 = 0,
+        firm_daily_wage: Money = 68,
+        firm_inventory: Goods = 0,
         /// Must be > 0, or the inventory bounds are 0 and the firm never hires.
-        firm_demand: u32 = 1,
+        firm_demand: Goods = 1,
     };
 };
