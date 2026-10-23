@@ -1,8 +1,21 @@
 const std = @import("std");
 const Firm = @import("Firm.zig");
 const Household = @import("Household.zig");
+const SupplierLink = @import("SupplierLink.zig");
 
 const Model = @This();
+
+
+config: Config,
+
+households: Household.Table,
+firms: Firm.Table,
+supplier_links: SupplierLink.Table,
+
+rng: std.Random.DefaultPrng,
+/// Runs continuously across months (month 1 = days 1-21, month 2 = 22-42).
+day: u32,
+month: u32,
 
 pub const Config = struct {
     /// H
@@ -40,11 +53,3 @@ pub const Config = struct {
         firm_demand: u32 = 1,
     };
 };
-
-config: Config,
-households: []Household,
-firms: []Firm,
-rng: std.Random.DefaultPrng,
-/// Runs continuously across months (month 1 = days 1-21, month 2 = 22-42).
-day: u32,
-month: u32,
