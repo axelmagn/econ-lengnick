@@ -1,0 +1,17 @@
+.{
+    .name = .econ_lengnick,
+    .version = "0.0.1",
+    .dependencies = .{
+        .cimgui = .{
+            .url = "git+https://github.com/floooh/dcimgui.git#8e6bfc80880a6a3b8c253e62616da86e079197ed",
+            .hash = "cimgui-0.1.0-44ClkYOmoADXtPjsxiH9_z-D1K7Lv7bs1kYq2tM7QANg",
+        },
+        .sokol = .{
+            .url = "git+https://github.com/floooh/sokol-zig.git#3990b6629704f988041ac7e76ed010348eabd098",
+            .hash = "sokol-0.1.0-pb1HK6dlQgAVK2z6p9B8rDIzrWEdxn0DeVTcpZrXmATG",
+        },
+    },
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+    .fingerprint = 0xade4aa47fdbb58e9,
+}
